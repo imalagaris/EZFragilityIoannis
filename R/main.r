@@ -236,13 +236,13 @@ estimateSOZ <- function(x, method = c("mean", "max", "min"), proportion = 0.1, .
     sozIndex
 }
 
-# data("pt01EcoG")
-# dmat <- pt01EcoG
-# colnames(dmat) <-
-#   colnames(dmat) |>
-#   as.double() |>
-#   lapply(\(x) sprintf("%.3f", x)) |>
-#   unlist()
+data("pt01EcoG")
+dmat <- pt01EcoG
+colnames(dmat) <-
+  colnames(dmat) |>
+  as.double() |>
+  lapply(\(x) sprintf("%.3f", x)) |>
+  unlist()
 
 
 standardizeIEEG <- function(data) {
