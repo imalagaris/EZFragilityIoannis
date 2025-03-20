@@ -1,15 +1,67 @@
+fragTimeRaw <- \(
+    data,
+    window,          # in milliseconds
+    step,            # in milliseconds
+    origin = 0,      # in seconds (map first col to start time)
+    samplingRate = 1 # in milliseconds, sampling rate
+) {
+    colID <- fragID <- Col2Time <- Time2Col <- endTime <- NULL
+    self <- environment()
+    SR <- samplingRate * 1e-3
+    w <-  window / samplingRate
+    u <- step / samplingRate
+    n = ncol(data)
+    Step2Col <- \(s) w + u * (s - 1L)
+    Col2Step <- \(i) (i - 1L) %/% u + 1
+    STEPS <- seq_len(Col2Step(n))
+    init <- \(t0 = origin) {
+        self$origin <- t0
+        self$endTime <- (n - 1) * SR + origin
+        self$fragID <- STEPS |> setNames(origin + (Step2Col(STEPS) - w) * SR)
+        self$Col2Time <- \(x) (origin + (x - 1) * SR) |> round(3)
+        colNms <- Col2Time(seq_len(n))
+        self$colID <- seq_len(n) |> setNames(colNms)
+        colnames(self$data) <- colNms
+        self$Time2Col <- \(x) (round(x, 3) - origin) / SR + 1
+        self$getIds <- \(x = origin, y = endTime + SR, Frag = FALSE) {
+            if (length(x) == 2L) {y <- x[2L]; x <- x[1L]}
+            stopifnot(x < y, origin <= x, y <= endTime + SR)
+            a <- Time2Col(x)
+            z <- Time2Col(y) - 1L
+            if (Frag) fragID[Col2Step(a):Col2Step(z)]
+            else colID[a:z]
+        }
+        self$datSubset <- \(x = origin, y = endTime + SR) {
+            data[, getIds(x, y), drop = FALSE]
+        }
+        invisible(self)
+    }
+    setOrigin <- \(newOrigin) init(newOrigin)
+    init()
+}
+
+
+
+
+
 #' @title Epoch Class
 #' @description S4 class to handle epoch data with electrodes and time points
 #' @slot data a tibble containing epoch data (columns=time points, rows=electrodes)
 #' @slot times Numeric vector containing time range
-.Epoch <- setClass("Epoch",
+.Epoch <- setClass(
+    "Epoch",
     slots = list(
         data = "matrix",
-        times = "numericOrNULL"
+        window = "numeric",
+        step = "numeric",
+        origin = "numeric",
+        samplingRate = "numeric",
+        times = "numericOrNULL",
+        e = "envOrNULL",
+        sb = "funOrNULL",
+        setOrigin = "funOrNULL"
     )
 )
-
-
 
 #' Constructor for Epoch class
 #' @param data Matrix containing epoch data (rows=electrodes, columns=time points)
@@ -20,7 +72,16 @@
 #' timeRanges can be non-null
 #' @export
 #' @return An Epoch object
-Epoch <- function(data, electrodes = NULL, timeRanges = NULL, times = NULL) {
+Epoch <- function(
+        data,
+        window,
+        step,
+        origin = 0,
+        samplingRate = 1,
+        electrodes = NULL, 
+        timeRanges = NULL, 
+        times = NULL
+) {
     if (!is.null(times) && !is.null(timeRanges)) {
         stop("Only one of times or timeRanges can be non-null")
     }
@@ -33,7 +94,7 @@ Epoch <- function(data, electrodes = NULL, timeRanges = NULL, times = NULL) {
     if (!is.null(electrodes) && nrow(data) != length(electrodes)) {
         stop("Length of electrodes must be equal to number of rows in data")
     }
-
+    
     # set default time points if not provided
     if (is.null(times)) {
         if (is.null(timeRanges)) {
@@ -47,8 +108,8 @@ Epoch <- function(data, electrodes = NULL, timeRanges = NULL, times = NULL) {
     } else {
         times <- as.numeric(times)
     }
-
-
+    
+    
     # Set default electrode names if not provided
     if (is.null(electrodes)) {
         electrodes <- if (!is.null(rownames(data))) {
@@ -57,14 +118,22 @@ Epoch <- function(data, electrodes = NULL, timeRanges = NULL, times = NULL) {
             paste0("E", seq_len(nrow(data)))
         }
     }
-
+    
     rownames(data) <- electrodes
     colnames(data) <- NULL
-
+    
+    e <- fragTimeRaw(data, window, step, origin, samplingRate)
     # Create new Epoch object
     .Epoch(
         data = data,
-        times = times
+        window = window,
+        step = step,
+        origin = origin,
+        samplingRate = samplingRate,
+        times = times,
+        e = e
+        # sb = e$datSubset,
+        # setOrigin = e$setOrigin
     )
 }
 
@@ -92,11 +161,11 @@ setMethod("$", "Epoch", function(x, name) {
         stop(glue("Invalid field name: {name}, must be one of {paste0(names(x), collapse = ', ')}"))
     }
     switch(name,
-        electrodes = rownames(x@data),
-        times = x@times,
-        timeRange = if (!is.null(x@times)) range(x@times) else NULL,
-        data = x@data,
-        stop(glue("Unexpected field name {name}"))
+           electrodes = rownames(x@data),
+           times = x@times,
+           timeRange = if (!is.null(x@times)) range(x@times) else NULL,
+           data = x@data,
+           stop(glue("Unexpected field name {name}"))
     )
 })
 
@@ -109,28 +178,28 @@ setMethod("$<-", "Epoch", function(x, name, value) {
     if (name == "electrodes") {
         rownames(x@data) <- value
     }
-
+    
     if (name == "times") {
         x@times <- value
     }
-
+    
     if (name == "timeRange") {
         if (length(value) != 2) {
             stop("timeRange must be a numeric vector of length 2")
         }
         x@times <- seq(value[1], value[2], length.out = nrow(x@data))
     }
-
+    
     if (name == "data") {
         colNms <- rownames(value)
         rowNms <- colnames(value)
-
+        
         rownames(value) <- x$electrodes
         colnames(value) <- x$times
-
+        
         x <- Epoch(value, electrodes = colNms, times = rowNms)
     }
-
+    
     invisible(x)
 })
 
@@ -148,13 +217,13 @@ setMethod("[", "Epoch", function(x, i, j) {
     }
     
     new_data <- x@data[i, j, drop = FALSE]
-
+    
     if (missing(j)) {
         newTimes <- x@times
     } else {
         newTimes <- x@times[j]
     }
-
+    
     Epoch(
         data = new_data,
         times = newTimes
@@ -272,9 +341,9 @@ setMethod("truncateTime", "Epoch", function(x, from, to) {
         indices <- which(times >= from & times <= to)
         newTimes <- times[indices]
     }
-
+    
     newData <- x$data[, indices, drop = FALSE]
-
+    
     # Create new Epoch object with truncated data
     Epoch(
         data = newData,

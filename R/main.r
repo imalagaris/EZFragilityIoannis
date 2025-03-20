@@ -236,56 +236,7 @@ estimateSOZ <- function(x, method = c("mean", "max", "min"), proportion = 0.1, .
     sozIndex
 }
 
-# data("pt01EcoG")
-# dmat <- pt01EcoG
-# colnames(dmat) <-
-#   colnames(dmat) |>
-#   as.double() |>
-#   lapply(\(x) sprintf("%.3f", x)) |>
-#   unlist()
-
-
 standardizeIEEG <- function(data) {
     scaling <- 10^floor(log10(max(data)))
     plotData <- data / scaling
-}
-
-fragTime <- \(
-    ieegts,
-    window,          # in milliseconds
-    step,            # in milliseconds
-    origin = 0,      # in seconds (map first col to start time)
-    samplingRate = 1 # in milliseconds, sampling rate
-) {
-    colID <- fragID <- Col2Time <- Time2Col <- endTime <- NULL
-    self <- environment()
-    SR <- samplingRate * 1e-3
-    w <-  window / samplingRate
-    u <- step / samplingRate
-    n = ncol(ieegts)
-    Step2Col <- \(s) w + u * (s - 1L)
-    Col2Step <- \(i) (i - 1L) %/% u + 1
-    STEPS <- seq_len(Col2Step(n))
-    init <- \(t0 = origin) {
-        self$origin <- t0
-        self$endTime <- (n - 1) * SR + origin
-        self$fragID <- STEPS |> setNames(origin + (Step2Col(STEPS) - w) * SR)
-        self$Col2Time <- \(x) (origin + (x - 1) * SR) |> round(3)
-        self$colID <- seq_len(n) |> setNames(Col2Time(seq_len(n)))
-        self$Time2Col <- \(x) (round(x, 3) - origin) / SR + 1
-        self$getIds <- \(x = origin, y = endTime + SR, Frag = FALSE) {
-            if (length(x) == 2L) {y <- x[2L]; x <- x[1L]}
-            stopifnot(x < y, origin <= x, y <= endTime + SR)
-            a <- Time2Col(x)
-            z <- Time2Col(y) - 1L
-            if (Frag) fragID[Col2Step(a):Col2Step(z)]
-            else colID[a:z]
-        }
-        self$datSubset <- \(x = origin, y = endTime + SR) {
-            ieegts[, getIds(x, y), drop = FALSE]
-        }
-        invisible(self)
-    }
-    setOrigin <- \(newOrigin) init(newOrigin)
-    init()
 }
