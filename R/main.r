@@ -10,7 +10,7 @@
 #' (\href{https://pubmed.ncbi.nlm.nih.gov/34354282/}{pubmed}).
 #' We have found solutions to fill up missing details in the paper method description
 #'
-#' @param ieegts Numeric. A matrix of iEEG time series x(t),
+#' @param epoch `Epoch` object. It contains matrix of iEEG time series x(t),
 #' with electrodes names as rows and time points as columns, or an Epoch object
 #' @param window Integer. The number of time points to use in each window
 #' @param step Integer. The number of time points to move the window each time
@@ -19,9 +19,7 @@
 #' ensuring that ensuring that the adjacent matrix is stable (see details)
 #' @param nSearch Integer. Number of lambda values to search for the minimum norm perturbation. This parameter is used only when the lambda is NULL
 #' @param progress Logical. If TRUE, print progress information. If `parallel` is TRUE, this option only support the `doSNOW` backend.
-#' @param parallel Logical. If TRUE, use parallel computing.
-#' Users must register a parallel backend with the foreach package
-#'
+#' @param nthread Integer (Default = 1). Number of threads to be used for parallel computing
 #'
 #' @return A Fragility object
 #'
@@ -30,34 +28,15 @@
 #' data <- matrix(rnorm(100), nrow = 5)
 #' ## create an Epoch object
 #' epoch <- Epoch(data)
-#' windowNum <- 10
-#' step <- 5
-#' lambda <- 0.1
-#' calcAdjFrag(
-#'     epoch = epoch, window = windowNum,
-#'     step = step, lambda = lambda, progress = TRUE
-#' )
+#' calcAdjFrag(epoch = epoch, window = 10, step = 5, lambda = 0.1)
 #'
 #' ## A more realistic example with parallel computing
 #' \dontrun{
-#' ## Register a SNOW backend with 4 workers
 #' library(parallel)
 #' library(doSNOW)
-#' cl <- makeCluster(4, type = "SOCK")
-#' registerDoSNOW(cl)
-#'
 #' data("pt01EcoG")
 #' epoch <- Epoch(pt01EcoG)
-#' window <- 250
-#' step <- 125
-#' title <- "PT01 seizure 1"
-#' calcAdjFrag(
-#'     epoch = epoch, window = window,
-#'     step = step, parallel = TRUE, progress = TRUE
-#' )
-#'
-#' ## stop the parallel backend
-#' stopCluster(cl)
+#' calcAdjFrag(epoch = epoch, window = 250, step = 125, nthread = 4)
 #' }
 #'
 #' @details
@@ -74,15 +53,15 @@
 #' Each column is normalized \eqn{\frac{max(\Gamma_{i})-\Gamma_{ik}}{max(\Gamma_i)}}
 #'
 #' @export
-calcAdjFrag <- function(epoch, window, step, lambda = NULL, nSearch = 100L, progress = FALSE, parallel = FALSE) {
+calcAdjFrag <- function(epoch, window, step, lambda = NULL, nSearch = 100L, progress = TRUE, nthread = 1) {
     ## check the input types
     stopifnot(is.matrix(epoch) | is(epoch, "Epoch"))
     stopifnot(isWholeNumber(window))
     stopifnot(isWholeNumber(step))
     stopifnot(step > 0)
     stopifnot(is.null(lambda) | is.numeric(lambda))
-
-
+    
+    
     if (!is(epoch, "Epoch")) {
         epoch <- Epoch(epoch)
     }
@@ -91,105 +70,83 @@ calcAdjFrag <- function(epoch, window, step, lambda = NULL, nSearch = 100L, prog
     elecNames <- epoch$electrodes
     timePoints <- epoch$times
     dataMat <- epoch$data
-
+    
     ## The input matrix must have at least window rows
     stopifnot(timeNum >= window)
-
+    
     dataMat <- standardizeIEEG(dataMat)
     # Number/sequence of steps
     nWindows <- floor((timeNum - window) / step) + 1L
     windows <- seq_len(nWindows)
     # Pre-allocate output
-
+    
     # dimension
     dm <- c(elecNum, elecNum, nWindows)
     # dimension names
     dmn <- list(Electrode = elecNames, Step = windows)
     # dimension names for adjacency matrix
     dmnA <- list(Electrode1 = elecNames, Electrode2 = elecNames, Step = windows)
-
+    
     # Pre-allocate output
     A <- array(.0, dim = dm, dimnames = dmnA)
     R2 <- array(.0, dim = dm[-1], dimnames = dmn)
     f <- fR <- R2
     lbd <- rep(0, nWindows) |> setNames(windows)
-
+    
     ## switch between parallel and sequential computing
-    if (parallel) {
+    if (nthread > 1) {
         `%run%` <- foreach::`%dopar%`
-    } else {
-        `%run%` <- foreach::`%do%`
+        ncores <- min(nthread, parallel::detectCores() - 1)
+        cl <- snow::makeCluster(ncores, type = "SOCK")
+        doSNOW::registerDoSNOW(cl)
+        on.exit(snow::stopCluster(cl), add = TRUE)
     }
-
+    else `%run%` <- foreach::`%do%`
+    
     ## initialize the progress bar
     if (progress) {
+        fmt <- "Step = :current/:total [:bar] :percent in :elapsed | eta: :eta"
         pb <- progress_bar$new(
-            format = "Step = :current/:total [:bar] :percent in :elapsed | eta: :eta",
-            total = nWindows,
-            width = 60
+            format = fmt,
+            total  = nWindows,
+            width  = 60
         )
-
-        progress <- function(n) {
-            pb$tick()
-        }
+        
+        progress <- \(n) pb$tick() 
         opts <- list(progress = progress)
         on.exit(pb$terminate())
-    } else {
+    } 
+    else {
         opts <- list()
-
-        progress <- function(n) {
-            NULL
-        }
+        progress <- \(n) invisible()
     }
-
+    
     ## Initial data for data aggregation
     init <- list(A = A, R2 = R2, f = f, lbd = lbd)
+    .IterFun <- .IterFunInit(environment())
     foreach(
         iw = windows,
         .combine = .combine,
         .init = init,
         .inorder = FALSE,
         .options.snow = opts
-    ) %run% {
-        progress(iw)
-        ## Those are necessary to clear R check issue
-        iw <- get("iw")
-        .ridgeSearch <- getFromNamespace("ridgeSearch", "EZFragility")
-        .ridgeR2 <- getFromNamespace("ridgeR2", "EZFragility")
-        .fragilityRow <- getFromNamespace("fragilityRow", "EZFragility")
-
-        ## slice indices
-        si <- (iw - 1L) * step + seq_len(window - 1L)
-        xt <- dataMat[, si, drop = FALSE]
-        xtp1 <- dataMat[, si + 1L, drop = FALSE]
-
-        adjMatrix <- .ridgeSearch(xt, xtp1, lambda)
-        R2Column <- .ridgeR2(xt, xtp1, adjMatrix)
-        fColumn <- .fragilityRow(adjMatrix, nSearch)
-
-        list(
-            iw = iw,
-            adjMatrix = adjMatrix,
-            R2Column = R2Column,
-            fColumn = fColumn
-        )
-    } -> results
-
+    ) %run% .IterFun(iw = get("iw")) -> results
+    
     ## unpack the results
     A <- results$A
     R2 <- results$R2
     f <- results$f
     lbd <- results$lbd
-
+    
     ## column rank of fragility matrix
     fR <- apply(f, 2, rank) / elecNum
-
+    
     ## start time point/indices for each partition
     startTimes <- (seq_len(nWindows) - 1L) * step + 1L
     if (!is.null(epoch$times)) {
         startTimes <- epoch$times[startTimes]
     }
-
+    
     ## TODO: why the row of frag is the electrode names? not the column of frag?
     ## This does not match the input data
     Fragility(
@@ -209,12 +166,42 @@ calcAdjFrag <- function(epoch, window, step, lambda = NULL, nSearch = 100L, prog
     adjMatrix <- x$adjMatrix
     R2Column <- x$R2Column
     fColumn <- x$fColumn
-
+    
     results$A[, , iw] <- adjMatrix
     results$R2[, iw] <- R2Column
     results$f[, iw] <- fColumn
     results$lbd[[iw]] <- attr(adjMatrix, "lambda")
     results
+}
+
+.IterFunInit <- \(e) {
+    window    <- e$window
+    step      <- e$step
+    lambda    <- e$lambda
+    nSearch   <- e$nSearch
+    dataMat   <- e$dataMat
+    .progress <- e$progress
+    .ridgeSearch  <- utils::getFromNamespace("ridgeSearch",  "EZFragility")
+    .ridgeR2      <- utils::getFromNamespace("ridgeR2",      "EZFragility")
+    .fragilityRow <- utils::getFromNamespace("fragilityRow", "EZFragility")
+    
+    \(iw) {
+        .progress(iw)
+        si   <- (iw - 1L) * step + seq_len(window - 1L)
+        xt   <- dataMat[, si, drop = FALSE]
+        xtp1 <- dataMat[, si + 1L, drop = FALSE]
+        
+        adjMatrix <- .ridgeSearch(xt, xtp1, lambda)
+        R2Column  <- .ridgeR2(xt, xtp1, adjMatrix)
+        fColumn   <- .fragilityRow(adjMatrix, nSearch)
+        
+        list(
+            iw = iw,
+            adjMatrix = adjMatrix,
+            R2Column = R2Column,
+            fColumn = fColumn
+        )
+    }
 }
 
 #' Find Serzure Onset Zone
@@ -232,32 +219,73 @@ calcAdjFrag <- function(epoch, window, step, lambda = NULL, nSearch = 100L, prog
 #' @export
 estimateSOZ <- function(x, method = c("mean", "max", "min"), proportion = 0.1, ...) {
     method <- match.arg(method)
-
     stopifnot(is(x, "Fragility"))
-
+    
     fragMat <- x$frag
     elCnt <- nrow(fragMat)
     nSOZ <- ceiling(elCnt * proportion)
     stopifnot(nSOZ > 0 & nSOZ <= elCnt)
-
-    if (method == "max") {
-        stat <- apply(fragMat, 1, max)
-    } else if (method == "min") {
-        stat <- apply(fragMat, 1, min)
-    } else if (method == "mean") {
-        stat <- apply(fragMat, 1, mean)
-    }
-
+    
+    if      (method == "max")  stat <- apply(fragMat, 1, max)
+    else if (method == "min")  stat <- apply(fragMat, 1, min)
+    else if (method == "mean") stat <- apply(fragMat, 1, mean)
+    
     sozIndex <- order(stat, decreasing = TRUE)[seq_len(nSOZ)]
-    if (!is.null(x$electrodes)) {
-        sozIndex <- x$electrodes[sozIndex]
-    }
-
+    if (!is.null(x$electrodes)) sozIndex <- x$electrodes[sozIndex]
+    
     sozIndex
 }
+
+# data("pt01EcoG")
+# dmat <- pt01EcoG
+# colnames(dmat) <-
+#   colnames(dmat) |>
+#   as.double() |>
+#   lapply(\(x) sprintf("%.3f", x)) |>
+#   unlist()
 
 
 standardizeIEEG <- function(data) {
     scaling <- 10^floor(log10(max(data)))
     plotData <- data / scaling
+}
+
+fragTime <- \(
+    ieegts,
+    window,          # in milliseconds
+    step,            # in milliseconds
+    origin = 0,      # in seconds (map first col to start time)
+    samplingRate = 1 # in milliseconds, sampling rate
+) {
+    colID <- fragID <- Col2Time <- Time2Col <- endTime <- NULL
+    self <- environment()
+    SR <- samplingRate * 1e-3
+    w <-  window / samplingRate
+    u <- step / samplingRate
+    n = ncol(ieegts)
+    Step2Col <- \(s) w + u * (s - 1L)
+    Col2Step <- \(i) (i - 1L) %/% u + 1
+    STEPS <- seq_len(Col2Step(n))
+    init <- \(t0 = origin) {
+        self$origin <- t0
+        self$endTime <- (n - 1) * SR + origin
+        self$fragID <- STEPS |> setNames(origin + (Step2Col(STEPS) - w) * SR)
+        self$Col2Time <- \(x) (origin + (x - 1) * SR) |> round(3)
+        self$colID <- seq_len(n) |> setNames(Col2Time(seq_len(n)))
+        self$Time2Col <- \(x) (round(x, 3) - origin) / SR + 1
+        self$getIds <- \(x = origin, y = endTime + SR, Frag = FALSE) {
+            if (length(x) == 2L) {y <- x[2L]; x <- x[1L]}
+            stopifnot(x < y, origin <= x, y <= endTime + SR)
+            a <- Time2Col(x)
+            z <- Time2Col(y) - 1L
+            if (Frag) fragID[Col2Step(a):Col2Step(z)]
+            else colID[a:z]
+        }
+        self$datSubset <- \(x = origin, y = endTime + SR) {
+            ieegts[, getIds(x, y), drop = FALSE]
+        }
+        invisible(self)
+    }
+    setOrigin <- \(newOrigin) init(newOrigin)
+    init()
 }
